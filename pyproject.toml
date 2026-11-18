@@ -1,0 +1,16 @@
+[project]
+name = "shapes"
+version = "0.1.0"
+description = "Synthetic helper package used only to prove an autonomy merge gate."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.4"]
+
+[tool.pytest.ini_options]
+# `pytest -q` runs only the package tests in tests/.
+# The gate tests in tests_gate/ run in a separate CI job, gate-tests (see ci.yml).
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"

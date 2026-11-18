@@ -1,0 +1,87 @@
+# Workflow B: trusted, privileged merge gate.
+#
+# Trigger choice:
+# - workflow_run (ci completed): the main trigger. GitHub runs it from the
+#   workflow file on the DEFAULT branch, in the base repository context, so a
+#   pull request cannot change this file or gate.py for its own evaluation.
+# - pull_request_target: early feedback and re-evaluation when the label is
+#   added after CI finished. It also uses the base-branch workflow file. It is
+#   dangerous only if a job checks out or runs pull request code. This job
+#   never does: it checks out `main` only.
+# - workflow_dispatch: manual re-evaluation of one pull request by number.
+#   Any caller can only make the gate evaluate again; every rule still applies.
+#
+# Shell safety: no `${{ }}` expression in any `run:` script. The script reads
+# the event from GITHUB_EVENT_PATH and all other data from the REST API.
+name: autonomy-gate
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled, ready_for_review]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull request number to evaluate"
+        required: true
+        type: string
+
+# Nothing at workflow level. The job asks for what it needs.
+permissions: {}
+
+# Concurrency: one job-level lane only (below). This workflow has one job, so
+# the lane serialises every gate run in the repository; a workflow-level group
+# adds nothing.
+# LIMIT: a concurrency group keeps at most ONE pending run. A newer run that
+# joins the group replaces (cancels) the pending one, even with
+# cancel-in-progress: false. The replaced evaluation is lost; a later event
+# (CI completion, label change, push, or a manual dispatch) triggers it again.
+
+jobs:
+  gate:
+    name: evaluate
+    # workflow_dispatch runs the workflow file from the ref the caller picks.
+    # Allow a dispatch only from main. gate.py checks GITHUB_REF again.
+    # LIMIT: a copy of this file on another ref that an attacker has EDITED
+    # can drop this line; only the token's lack of Workflows permission stops that.
+    if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The merge lane: only one gate run in the repository evaluates, approves
+    # or merges at a time. The running job is never cancelled by a newer one.
+    concurrency:
+      group: autonomy-gate-merge-lane
+      cancel-in-progress: false
+    permissions:
+      contents: write        # merge endpoint
+      pull-requests: write   # approve, dismiss approvals, comment
+      checks: write          # create the autonomy-gate check run (see SETUP.md)
+      actions: read          # read the ci.yml run and its jobs
+    steps:
+      - name: Check out gate code from main only
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: .github/autonomy
+          sparse-checkout-cone-mode: false
+      - name: Evaluate one pull request
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Read at run time from repository settings, not from the pull request.
+          AUTONOMY_ENABLED: ${{ vars.AUTONOMY_ENABLED }}
+        # -I: isolated mode. Ignore PYTHON* variables and the current directory.
+        # Order inside gate.py: pending check, re-check, approve, success check, merge.
+        run: python3 -I .github/autonomy/gate.py
+      # Runs even if the job is cancelled or the step above fails. If gate.py
+      # approved but did not confirm the merge, post a failing check, then
+      # dismiss the gate's approvals. A merged or closed pull request gets no
+      # writes. Best effort: if the runner itself dies, this does not run.
+      - name: Withdraw approval unless the merge is confirmed
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -I .github/autonomy/gate.py --cleanup
