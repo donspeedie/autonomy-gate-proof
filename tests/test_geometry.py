@@ -37,3 +37,5 @@ def test_centroid() -> None:
 def test_centroid_rejects_empty() -> None:
     with pytest.raises(ValueError):
         geometry.centroid([])
+
+# gate probe edit
