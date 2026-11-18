@@ -2,8 +2,10 @@
   "schema": 1,
   "enabled": true,
   "enabled_until_utc": "2026-12-05T00:00:00Z",
-  "allowed_path_globs": ["tests/test_*.py"],
-  "max_files": 2,
+  "allowed_path_globs": [
+    "tests/test_*.py"
+  ],
+  "max_files": 3,
   "max_added_lines": 200,
   "max_deleted_lines": 0,
   "max_bytes_per_file": 16000,
@@ -14,5 +16,8 @@
   "max_merges_per_utc_day": 1,
   "max_total_merges": 5,
   "required_ci_workflow": "ci.yml",
-  "required_ci_jobs": ["tests", "gate-tests"]
+  "required_ci_jobs": [
+    "tests",
+    "gate-tests"
+  ]
 }
