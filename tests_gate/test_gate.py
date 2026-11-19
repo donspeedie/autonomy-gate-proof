@@ -664,12 +664,29 @@ def test_max_open_prs_from_mandate() -> None:
 
 def test_merge_already_today() -> None:
     w = World()
+    w.mandate["max_merges_per_utc_day"] = 1
     w.closed_prs = [make_pr(number=5, merged_at="2026-11-20T01:00:00Z")]
+    assert_refused(w, "daily-limit")
+
+
+def test_daily_cap_two_allows_second_merge() -> None:
+    w = World()
+    w.mandate["max_merges_per_utc_day"] = 2
+    w.closed_prs = [make_pr(number=5, merged_at="2026-11-20T01:00:00Z")]
+    decision, _ = run(w)
+    assert decision is not None and decision.approved
+
+
+def test_daily_cap_two_refuses_third_merge() -> None:
+    w = World()
+    w.mandate["max_merges_per_utc_day"] = 2
+    w.closed_prs = [make_pr(number=n, merged_at=f"2026-11-20T0{n}:00:00Z") for n in (4, 5)]
     assert_refused(w, "daily-limit")
 
 
 def test_merge_today_counted_even_if_label_removed() -> None:
     w = World()
+    w.mandate["max_merges_per_utc_day"] = 1
     w.closed_prs = [make_pr(number=5, labels=(), merged_at="2026-11-20T01:00:00Z")]
     assert_refused(w, "daily-limit")
 
