@@ -26,7 +26,8 @@ Rules are pure functions. Each rule raises Refusal or Pending. `main()` builds
 a real REST client. Tests inject a fake client.
 
 Write order on a refusal: failing check first, then the comment. Errors are
-collected and raised at the end. A merged or closed pull request gets no writes.
+collected and raised at the end. A MERGED pull request gets no writes; a closed
+one still gets the failing check, because it can be reopened.
 
 Modes:
   gate.py            evaluate one pull request and act
@@ -619,24 +620,27 @@ def upsert_comment(client: Client, ctx: Context, pr_number: int, text: str) -> N
         client.request("POST", f"/repos/{ctx.repo}/issues/{pr_number}/comments", body)
 
 
-def pr_is_finished(client: Client, repo: str, pr_number: int) -> bool:
-    """True if the pull request is merged or closed. If the read fails, return False (act)."""
+def pr_is_merged(client: Client, repo: str, pr_number: int) -> bool:
+    """True ONLY if the server says the pull request is merged. If the read fails, return False (act).
+
+    A closed pull request is NOT finished: it can be reopened, and a success
+    check on its head would still let it merge. So it gets a failing check.
+    """
     try:
         pr = api_get(client, f"/repos/{repo}/pulls/{pr_number}")
     except Exception:  # noqa: BLE001 - unknown state: the safe side is to write
         return False
-    return isinstance(pr, dict) and (pr.get("merged") is True or pr.get("state") != "open")
+    return isinstance(pr, dict) and pr.get("merged") is True
 
 
 def refuse(client: Client, ctx: Context, d: Decision) -> None:
     """Record a refusal: failing check first, then one updated comment. Raise on errors.
 
-    A merged or closed pull request gets no writes at all.
+    A MERGED pull request gets no writes at all. A closed, unmerged pull request
+    gets the failing check (it may be reopened), but no comment.
     """
     assert not d.approved, "refuse() needs a refusal"
-    if d.rule == "not-open":
-        return
-    if d.pr_number is not None and pr_is_finished(client, ctx.repo, d.pr_number):
+    if d.pr_number is not None and pr_is_merged(client, ctx.repo, d.pr_number):
         return
     text = (f"**autonomy-gate refused** this pull request.\n\n"
             f"- rule: `{d.rule}`\n- detail: {d.detail}\n- head SHA: `{d.head_sha}`\n"
@@ -647,7 +651,7 @@ def refuse(client: Client, ctx: Context, d: Decision) -> None:
             set_check(client, ctx.repo, d.head_sha, False, text)
         except Exception as exc:  # noqa: BLE001 - still comment
             errors.append(f"failing check: {type(exc).__name__}: {exc}")
-    if d.pr_number is not None:
+    if d.pr_number is not None and d.rule != "not-open":
         try:
             upsert_comment(client, ctx, d.pr_number, text)
         except Exception as exc:  # noqa: BLE001 - collected
@@ -732,8 +736,8 @@ def cleanup(client: Client, repo: str, state: dict[str, Any] | None) -> bool:
     """If a success check may exist and the merge is not confirmed, post a failing check.
 
     `state` is {"pr": int, "head": SHA or None, "merged": bool}. The pull request
-    is read first: merged or closed means no writes (this covers a merge that the
-    server completed after the client timed out). The newest check run of the
+    is read first: ONLY merged means no writes (this covers a merge that the
+    server completed after the client timed out). Closed is not enough. The newest check run of the
     gate app then is a failure, so the head cannot merge. Errors are raised.
     """
     if not state or state.get("merged") is True:
@@ -745,8 +749,9 @@ def cleanup(client: Client, repo: str, state: dict[str, Any] | None) -> bool:
     except Exception:  # noqa: BLE001 - unknown state: do the safe action
         pr = None
     if isinstance(pr, dict):
-        if pr.get("merged") is True or pr.get("state") != "open":
+        if pr.get("merged") is True:
             return False
+        # Closed but not merged: still post the failing check (it may be reopened).
         if head is None:
             head = str((pr.get("head") or {}).get("sha", ""))
     head = head if isinstance(head, str) and SHA.fullmatch(head) else None

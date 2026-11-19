@@ -77,9 +77,9 @@ its cleanup step post a failing check on X, so the newest gate check is a failur
 | 3 | Allowed actions, variable `false`, label, no repository secrets | 4 to 7 |
 | 4 | Owner: create the environment `autonomy-gate` with the `main`-only rule. Do this FIRST. | GATE-APP-SETUP.md Part 1 |
 | 5 | Owner: create the gate app, store its two environment secrets, install it on this repository only. Send the App ID to the operator. | GATE-APP-SETUP.md Parts 2 to 4 |
-| 6 | Operator: merge the gate-app change to `main` and apply the new protection | 8a |
-| 7 | Run negative-test group 0 (agent-pushed workflows), then groups 1, 3 and 4. The variable stays `false`. | NEGATIVE-TESTS.md |
-| 8 | Stop here if any of those tests fails | |
+| 6 | Owner and operator: merge the gate-app change to `main`, apply the new protection and the ruleset | 8a, 8b |
+| 7 | Run platform test P0 (ruleset bypass), then group 0 (agent-pushed workflows), then groups 1, 3 and 4. The variable stays `false`. | NEGATIVE-TESTS.md |
+| 8 | Stop here if any of those tests fails. If P0 fails, get the owner's explicit decision on the residual risk (8a). | |
 | 9 | Set the variable to `true`. Run group 5. | 9, NEGATIVE-TESTS.md |
 | 10 | Run group 6, the positive case P1, then 0.4 | NEGATIVE-TESTS.md |
 
@@ -162,8 +162,8 @@ Why, per field:
 - `autonomy-gate` with the gate app's `app_id`: only a token of the gate app can
   create this check. A workflow the agent pushes runs as app 15368, and the
   agent's own credential is the Claude app. Neither can produce it.
-- `tests` and `gate-tests` from app 15368: LIMIT: a workflow the agent pushes
-  can create check runs with these names as app 15368 on any SHA. So these two
+- `tests` and `gate-tests` from app 15368: FINDING: any workflow the agent
+  pushes can create check runs with these names as app 15368 on any SHA. So these two
   requirements are a convenience, not a control. The binding CI evidence is the
   gate's own read of the `ci.yml` run: exact head SHA, event `pull_request`,
   path `.github/workflows/ci.yml`, linked to this pull request, both jobs green.
@@ -175,28 +175,92 @@ Why, per field:
 - `enforce_admins: true`: the owner gets no bypass.
 - No force pushes, no deletions, linear history.
 
-## 8a. Transition from the review-based protection
+## 8a. Ruleset: only the gate app may update `main`
 
-The protection now on `main` requires a review and `autonomy-gate` from app
-15368. This change touches `.github/`, so the gate refuses it on the path rule
-(expected), and nobody can give the review. The operator merges it by hand,
-after steps 4 and 5:
+Classic protection alone has a gap. Once the gate app's success check exists
+on a head, ANYONE with merge rights can merge that head, the agent included.
+The success check normally lives for a second or two, between the success
+check and the gate's own merge call. Two events can make it stay:
 
-```powershell
-# 1. Check the environment rule and secrets. Expect "main branch", then the two secret names.
-gh api "repos/$R/environments/autonomy-gate/deployment-branch-policies" --jq '.branch_policies[] | [.name, .type] | @tsv'
-gh api "repos/$R/environments/autonomy-gate/secrets" --jq '.secrets[].name'
-# 2. Check that the variable is false.
-gh api "repos/$R/actions/variables/AUTONOMY_ENABLED" --jq .value
-# 3. Remove protection, squash-merge, and apply the NEW protection at once.
-gh api -X DELETE "repos/$R/branches/main/protection"
-gh pr merge <N> -R $R --squash --match-head-commit <HEAD_SHA>
-gh api -X PUT "repos/$R/branches/main/protection" --input protection.json
+- `POST actions/runs/{id}/force-cancel` (the agent has `actions: write`).
+  Force-cancel skips `if: always()` steps, so the cleanup step does not run.
+- The runner dies. The cleanup step does not run either.
+
+Then the agent can merge the head itself, for example after the owner has
+turned the stop switch off. The head is one the gate validated, but the merge
+happens after a stop.
+
+The strongest control: a repository ruleset on `main` with the rule "Restrict
+updates", whose ONLY bypass actor is the gate app. Then only the gate app can
+move `main`, so only the gate's own merge call can merge. This is in addition
+to the classic protection, not instead of it.
+
+Save as `ruleset.json`. Replace `REPLACE_WITH_GATE_APP_ID` with the App ID
+number (no quotes):
+
+```json
+{
+  "name": "main-only-gate-app-updates",
+  "target": "branch",
+  "enforcement": "active",
+  "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+  "rules": [{"type": "update", "parameters": {"update_allows_fetch_and_merge": false}}],
+  "bypass_actors": [{"actor_id": REPLACE_WITH_GATE_APP_ID, "actor_type": "Integration", "bypass_mode": "always"}]
+}
 ```
 
-`protection.json` is the file from `GATE-APP-SETUP.md`, "New branch protection",
-with the App ID filled in. The window without protection lasts only between
-the DELETE and the PUT. Before the DELETE, check that no agent run is active.
+```powershell
+gh api -X POST "repos/$R/rulesets" --input ruleset.json
+gh api "repos/$R/rulesets" --jq '.[] | [.id, .name, .enforcement] | @tsv'
+gh api "repos/$R/rulesets/<RULESET_ID>" --jq '.rules, .bypass_actors, .conditions'
+```
+
+The last command must show one `update` rule, one bypass actor (type
+`Integration`, the gate app id, mode `always`) and `~DEFAULT_BRANCH`.
+
+Effects to know:
+- The owner can no longer push or merge to `main` either. For a mandate or
+  gate change, set the ruleset `enforcement` to `disabled`, do the change, set
+  it back to `active`, and read it back.
+- Platform test P0 in `NEGATIVE-TESTS.md` must show that this works on this
+  personal public repository. **Do not set `AUTONOMY_ENABLED` to `true` until
+  P0 passes.**
+- If GitHub refuses an App as a bypass actor here, the gap above stays open.
+  The residual risk is a short window after a stop, in which the agent can
+  merge a head that the gate validated. Record that and ask the owner for an
+  explicit decision before step 9.
+
+## 8b. Transition from the review-based protection
+
+The protection now on `main` requires a review and `autonomy-gate` from app
+15368. This change touches `.github/`, so the gate refuses it (expected), and
+nobody can give the review. The owner merges it as an administrator after
+steps 4 and 5. Protection stays on for non-admins the whole time. Run one line
+at a time:
+
+```powershell
+# 0. Checks: expect "main branch", the two secret names, and "false".
+gh api "repos/$R/environments/autonomy-gate/deployment-branch-policies" --jq '.branch_policies[] | [.name, .type] | @tsv'
+gh api "repos/$R/environments/autonomy-gate/secrets" --jq '.secrets[].name'
+gh api "repos/$R/actions/variables/AUTONOMY_ENABLED" --jq .value
+# 1. Owner, on the web: Settings > Applications > Installed GitHub Apps > Claude > Configure > Suspend.
+# 2. Turn off admin enforcement only. Required checks and the review rule stay on for everyone else.
+gh api -X DELETE "repos/$R/branches/main/protection/enforce_admins"
+# 3. Owner merges as an administrator, pinned to the reviewed head.
+gh pr merge <N> -R $R --squash --admin --match-head-commit <HEAD_SHA>
+# 4. At once: the new protection (enforce_admins true), then the ruleset of section 8a.
+gh api -X PUT "repos/$R/branches/main/protection" --input protection.json
+gh api -X POST "repos/$R/rulesets" --input ruleset.json
+# 5. Read both back. Expect true, null, the three checks with app ids; then the active ruleset.
+gh api "repos/$R/branches/main/protection" --jq '.enforce_admins.enabled, .required_pull_request_reviews, [.required_status_checks.checks[] | [.context, .app_id]]'
+gh api "repos/$R/rulesets" --jq '.[] | [.id, .name, .enforcement] | @tsv'
+# 6. Owner, on the web: unsuspend the Claude app installation.
+```
+
+The Claude app is not installed on this repository yet, so steps 1 and 6 do
+nothing this time. Keep them in the procedure for every later transition.
+`protection.json` is the file from `GATE-APP-SETUP.md`, "New branch
+protection", with the App ID filled in.
 
 ## 9. Enable
 
@@ -237,7 +301,7 @@ open head is `success`. In that state the agent (contents write) could call the
 merge endpoint itself. Lock `main` first, then make the newest check a failure:
 
 ```powershell
-# 5. Lock main: set "lock_branch": true in protection.json, then apply it
+# 5. Lock main: set "lock_branch": true in protection.json, then apply it (the ruleset already blocks the agent if P0 passed)
 gh api -X PUT "repos/$R/branches/main/protection" --input protection.json
 # 6. Dispatch the gate from main for that pull request. The stop switch is off,
 #    so the gate refuses with stop-switch and posts a failing gate-app check.
@@ -256,9 +320,10 @@ gh api -X PUT "repos/$R/actions/workflows/autonomy-gate.yml/disable"
 # 10. Optional, slow: set "enabled": false in the mandate. This needs protection lifted.
 ```
 
-The cleanup step of the gate posts the failing check on cancel. It is best
-effort: if the runner dies, the cleanup step does not run. Steps 4 to 7 are the
-manual replacement.
+The cleanup step of the gate posts the failing check on a normal cancel. It
+does NOT run on force-cancel or runner death. Steps 4 to 7 are the manual
+replacement, and the ruleset of 8a is the structural one. If you used
+force-cancel in step 3, always do step 4.
 
 ## What the agent can still do (must be TESTED, not assumed)
 
@@ -269,13 +334,16 @@ Environments permission, and no Administration write.
 
 | Action | Through | Result |
 |--------|---------|--------|
-| Disable, cancel or re-run gate runs | Actions API (write) | Denial of service only. No gate run means no gate check, so no merge. A re-run of a `main` gate run re-evaluates with the current `gate.py`. |
+| Disable or cancel gate runs | Actions API (write) | Denial of service: no gate run means no new gate check. A normal cancel runs the cleanup step. |
+| Force-cancel a gate run between the success check and the merge | `POST actions/runs/{id}/force-cancel` | NOT only denial of service. Force-cancel skips the cleanup step (so does runner death), so the success check stays. Without the ruleset of 8a, the agent can then merge that head itself. With the ruleset, only the gate app can update `main`. |
+| Re-run old gate runs | Actions API (write) | The re-run uses that OLD run's workflow file, with environment access, for about 30 days. It checks out the current `gate.py`. See NEGATIVE-TESTS.md 4.4. |
 | Dispatch the gate from `main` | Actions API | A re-evaluation. Every rule applies. |
 | Dispatch an EDITED gate copy from its own branch | Actions API | That run has `GITHUB_REF` = the branch. The environment refuses it the secrets. |
 | Push a workflow on its own branch | git push (workflows write) | It runs as app 15368 on that branch's ref with any `GITHUB_TOKEN` permission it declares. See the next table. |
 | Create check runs (its own app) | Checks API | As the Claude app id. Protection ignores them. |
 | Add a repository webhook | Hooks API (write) | Event payloads go out. No secret values. Watch for it. |
-| Merge directly | Pulls API | Refused: the gate-app check is missing on the head (unless a success check exists; see kill step 5). |
+| Merge directly | Pulls API | Refused: the gate-app check is missing on the head. If a success check stays (force-cancel, runner death), only the ruleset of 8a refuses it. |
+| Fake the `tests` and `gate-tests` checks | Any pushed workflow | Possible (app 15368). Only the gate's own read of the `ci.yml` run and its jobs is binding. |
 
 What an agent-pushed workflow on its own branch can do with `GITHUB_TOKEN`:
 

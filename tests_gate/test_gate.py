@@ -79,6 +79,7 @@ class World:
     pr_labels: list[list[str]] | None = None  # successive label sets of the pull request
     merged: bool = False  # the server state of the pull request
     merged_on_merge_call: bool = False  # the merge call merges, then raises (client timeout)
+    closed_on_merge_call: bool = False  # the agent closes the pull request just before the merge call
     raise_on: str = ""  # a write path suffix that raises TimeoutError
     comments: list[dict[str, Any]] = field(default_factory=list)
     check_statuses: list[int] = field(default_factory=list)  # successive check-run statuses; then 201
@@ -125,6 +126,9 @@ class FakeClient:
         base = path.split("?", 1)[0]
         if method == "GET":
             return self._get(base, path)
+        if base.endswith("/merge") and self.w.closed_on_merge_call:
+            self.w.pr["state"] = "closed"
+            return gate.Response(405, {"message": "Pull Request is not mergeable"})
         if base.endswith("/merge") and self.w.merged_on_merge_call:
             self.w.merged = True
             raise TimeoutError("The read operation timed out")
@@ -434,12 +438,44 @@ def writes(client: FakeClient) -> list[tuple[str, str]]:
     return [(m, p) for m, p, _ in client.calls if m != "GET"]
 
 
-def test_not_open_makes_no_writes() -> None:
+def test_closed_unmerged_pr_gets_failing_check_and_no_comment() -> None:
+    """A closed pull request can be reopened. It is not finished: post a failing check."""
     w = World()
     w.pr["state"] = "closed"
     decision, client = run(w)
     assert decision is not None and decision.rule == "not-open"
-    assert writes(client) == []
+    assert [p.rsplit("/", 1)[-1] for _, p in writes(client)] == ["check-runs"]
+    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
+
+
+def test_close_before_merge_leaves_failing_check() -> None:
+    """Attack: the agent closes the PR after the success check and before the merge call."""
+    w = World(closed_on_merge_call=True)
+    decision, client = run(w)
+    assert decision is not None and not decision.approved and decision.rule == "merge-refused"
+    checks = client.wrote("POST", "/check-runs")
+    assert [c["conclusion"] for c in checks] == ["failure", "success", "failure"]
+    assert checks[-1]["head_sha"] == HEAD
+
+
+def test_reopen_after_close_before_merge_has_no_success_check() -> None:
+    """After the attack, the agent reopens. The newest gate check on X stays a failure."""
+    w = World(closed_on_merge_call=True)
+    _, first = run(w)
+    w.pr["state"] = "open"
+    w.closed_on_merge_call = False
+    _, second = run(w, stop="false")  # the stop switch is off after the incident
+    checks = first.wrote("POST", "/check-runs") + second.wrote("POST", "/check-runs")
+    assert checks[-1]["conclusion"] == "failure" and checks[-1]["head_sha"] == HEAD
+    assert not second.wrote("PUT", "/merge")
+
+
+def test_cleanup_posts_failing_check_on_closed_unmerged_pr() -> None:
+    w = World()
+    w.pr["state"] = "closed"
+    client = FakeClient(w)
+    assert gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False}) is True
+    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
 
 
 def test_merged_pr_makes_no_writes() -> None:
@@ -794,11 +830,9 @@ def test_cleanup_check_failure_raises() -> None:
         gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False})
 
 
-@pytest.mark.parametrize(("merged", "state"), [(True, "closed"), (False, "closed")])
-def test_cleanup_does_nothing_when_server_says_merged_or_closed(merged: bool, state: str) -> None:
-    """The journal says not merged, but the server merged after a client timeout (or closed)."""
-    w = World(merged=merged)
-    w.pr["state"] = state
+def test_cleanup_does_nothing_when_server_says_merged() -> None:
+    """The journal says not merged, but the server merged after a client timeout."""
+    w = World(merged=True)
     client = FakeClient(w)
     assert gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False}) is False
     assert writes(client) == []

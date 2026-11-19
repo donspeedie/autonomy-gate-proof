@@ -110,6 +110,12 @@ branch protection. The App ID is not a secret.
 
 If this step fails (for example, the code expired), use Part 2d instead.
 
+The line stays in your PowerShell history with the code in it. The risk is
+low: the code works one time only and expires after one hour. To remove the
+line anyway, run `notepad (Get-PSReadLineOption).HistorySavePath`, delete
+the line that starts with `$code =`, and save. `Clear-History` clears only
+the current window's list, not that file.
+
 ### 2d. Only if 2c failed, or to replace the key later: a .pem file
 
 1. Open `https://github.com/settings/apps`. Click your gate app.
@@ -152,6 +158,12 @@ gh api "repos/donspeedie/autonomy-gate-proof/environments/autonomy-gate/secrets"
 
 The first line must print exactly one line: `main` and `branch`.
 The second line must print `GATE_APP_CLIENT_ID` and `GATE_APP_PRIVATE_KEY`.
+
+Then check that auto-merge is still off. This must print `false`:
+
+```powershell
+gh api "repos/donspeedie/autonomy-gate-proof" --jq .allow_auto_merge
+```
 Send the App ID to the operator. Do not send the key.
 
 ## Operator commands
@@ -239,4 +251,5 @@ The strongest stop: suspend the gate app's installation. Then no gate run can
 mint a token, so no new `autonomy-gate` check and no merge by the gate.
 On the web: `https://github.com/settings/installations`, click **Configure**
 next to the gate app, then **Suspend**. See `SETUP.md`, "Kill procedure", for
-the order of the other steps.
+the order of the other steps. The ruleset that lets only the gate app update
+`main` is in `SETUP.md` section 8a.
