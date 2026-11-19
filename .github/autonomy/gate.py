@@ -8,22 +8,33 @@ The script evaluates ONE pull request against the mandate on `main`. It reads
 the head SHA once (X) and the `main` SHA once (M). It takes every later fact
 from data pinned to X and M: the mandate at M, the compare of M...X and the git
 trees of X and of the merge base. The merge base must be M. If every rule
-passes, it approves X and merges with `sha` = X. If any rule fails, it records
-the refusal and never approves.
+passes, it posts a successful `autonomy-gate` check run on X and merges with
+`sha` = X. If any rule fails, it posts a failing check run.
+
+Two tokens:
+- GITHUB_TOKEN (the workflow token) is READ-ONLY. Every GET uses it.
+- GATE_TOKEN is an installation token of the dedicated gate GitHub App. Every
+  write (check run, comment, merge) uses it. Branch protection requires the
+  `autonomy-gate` check from the gate app's id, so only this token can produce
+  the check that lets a merge through. The gate submits NO review: no review
+  is required, and the check run is the approval.
+
+If GATE_TOKEN is empty (the environment secrets do not exist yet), the gate
+runs in DRY-RUN mode: it evaluates, prints the decision and writes nothing.
 
 Rules are pure functions. Each rule raises Refusal or Pending. `main()` builds
 a real REST client. Tests inject a fake client.
 
-Write order on a refusal: failing check first, then every dismissal, then the
-comment. Errors are collected and raised at the end. A merged or closed pull
-request gets no writes at all.
+Write order on a refusal: failing check first, then the comment. Errors are
+collected and raised at the end. A merged or closed pull request gets no writes.
 
 Modes:
   gate.py            evaluate one pull request and act
-  gate.py --cleanup  if an approval was given but the merge is not confirmed,
-                     post a failing check and dismiss the gate's approvals
+  gate.py --cleanup  if a success check may exist but the merge is not
+                     confirmed, post a failing check
 
-Exit code: 0 for a clean decision, 1 for an internal error or a failed write.
+Exit code: 0 for a clean decision, 1 for an internal error, a failed write or
+a dry run.
 """
 
 from __future__ import annotations
@@ -41,7 +52,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 CHECK_NAME = "autonomy-gate"
-BOT_LOGIN = "github-actions[bot]"
+# The gate app's slug comes from actions/create-github-app-token (output app-slug).
+APP_SLUG = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
 COMMENT_MARKER = "<!-- autonomy-gate -->"
 BASE_BRANCH = "main"
 MAIN_REF = "refs/heads/main"
@@ -90,6 +102,26 @@ class Client(Protocol):
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Response: ...
 
 
+class SplitClient:
+    """Send every GET to the read-only reader and every other method to the writer."""
+
+    def __init__(self, reader: Client, writer: Client) -> None:
+        self._reader = reader
+        self._writer = writer
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Response:
+        if method == "GET":
+            return self._reader.request(method, path, body)
+        return self._writer.request(method, path, body)
+
+
+class NoWriteClient:
+    """Writer for dry-run mode. Any write is a programming error."""
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> Response:
+        raise RuntimeError(f"dry run: refused to send {method} {path}")
+
+
 def utc_now() -> dt.datetime:
     """Return the runner clock in UTC."""
     return dt.datetime.now(dt.timezone.utc)
@@ -109,6 +141,8 @@ class Context:
     ref: str = MAIN_REF
     clock: Callable[[], dt.datetime] = utc_now
     journal: Callable[[dict[str, Any]], None] = no_journal
+    bot_login: str = ""  # "<gate app slug>[bot]": author of the gate's own comment
+    dry_run: bool = False  # evaluate only; no writes
 
 
 @dataclass
@@ -549,10 +583,16 @@ def evaluate(client: Client, ctx: Context, pr_number: int) -> Decision:
 
 
 # ---------------------------------------------------------------- writes
+#
+# Every write goes through the gate app token. The check run is the approval:
+# branch protection requires `autonomy-gate` from the gate app's id. A check run
+# belongs to ONE commit SHA, so a new push leaves the new head with no gate
+# check until the gate runs again. The gate submits no review and dismisses none.
 
 
 def set_check(client: Client, repo: str, sha: str, success: bool, summary: str) -> None:
     """Create a completed check run named autonomy-gate on the head SHA."""
+    assert SHA.fullmatch(sha), "a check run needs a full head SHA"
     body = {
         "name": CHECK_NAME, "head_sha": sha, "status": "completed",
         "conclusion": "success" if success else "failure",
@@ -563,50 +603,20 @@ def set_check(client: Client, repo: str, sha: str, success: bool, summary: str) 
         raise RuntimeError(f"create check run returned HTTP {resp.status}")
 
 
-def upsert_comment(client: Client, repo: str, pr_number: int, text: str) -> None:
-    """Edit the gate's own earlier comment, or add one if none exists."""
+def upsert_comment(client: Client, ctx: Context, pr_number: int, text: str) -> None:
+    """Edit the gate app's own earlier comment, or add one if none exists.
+
+    Only a comment whose author is the gate app's bot counts as the gate's own.
+    Anyone can post a comment that contains the marker.
+    """
     body = {"body": f"{COMMENT_MARKER}\n{text}"}
-    comments = paginate(client, f"/repos/{repo}/issues/{pr_number}/comments")
-    own = [c for c in comments
-           if (c.get("user") or {}).get("login") == BOT_LOGIN and COMMENT_MARKER in str(c.get("body", ""))]
+    comments = paginate(client, f"/repos/{ctx.repo}/issues/{pr_number}/comments")
+    own = [c for c in comments if ctx.bot_login
+           and (c.get("user") or {}).get("login") == ctx.bot_login and COMMENT_MARKER in str(c.get("body", ""))]
     if own:
-        client.request("PATCH", f"/repos/{repo}/issues/comments/{own[0]['id']}", body)
+        client.request("PATCH", f"/repos/{ctx.repo}/issues/comments/{own[0]['id']}", body)
     else:
-        client.request("POST", f"/repos/{repo}/issues/{pr_number}/comments", body)
-
-
-def dismiss_gate_approvals(client: Client, repo: str, pr_number: int, reason: str) -> list[str]:
-    """Try to dismiss EVERY approval the gate gave. Return the errors; never stop early."""
-    try:
-        reviews = paginate(client, f"/repos/{repo}/pulls/{pr_number}/reviews")
-    except Exception as exc:  # noqa: BLE001 - collected and raised by the caller
-        return [f"dismissal: cannot list reviews: {type(exc).__name__}: {exc}"]
-    errors: list[str] = []
-    for review in reviews:
-        if (review.get("user") or {}).get("login") != BOT_LOGIN or review.get("state") != "APPROVED":
-            continue
-        try:
-            resp = client.request("PUT", f"/repos/{repo}/pulls/{pr_number}/reviews/{review['id']}/dismissals",
-                                  {"message": f"autonomy-gate: {reason}", "event": "DISMISS"})
-            if resp.status != 200:
-                errors.append(f"dismissal of review {review['id']} returned HTTP {resp.status}")
-        except Exception as exc:  # noqa: BLE001 - try the next review
-            errors.append(f"dismissal of review {review.get('id')} raised {type(exc).__name__}: {exc}")
-    return errors
-
-
-def withdraw(client: Client, repo: str, pr_number: int | None, head_sha: str | None,
-             summary: str, reason: str) -> list[str]:
-    """Failing check FIRST, then every dismissal. Return the collected errors."""
-    errors: list[str] = []
-    if head_sha:
-        try:
-            set_check(client, repo, head_sha, False, summary)
-        except Exception as exc:  # noqa: BLE001 - still dismiss
-            errors.append(f"failing check: {type(exc).__name__}: {exc}")
-    if pr_number is not None:
-        errors.extend(dismiss_gate_approvals(client, repo, pr_number, reason))
-    return errors
+        client.request("POST", f"/repos/{ctx.repo}/issues/{pr_number}/comments", body)
 
 
 def pr_is_finished(client: Client, repo: str, pr_number: int) -> bool:
@@ -619,7 +629,7 @@ def pr_is_finished(client: Client, repo: str, pr_number: int) -> bool:
 
 
 def refuse(client: Client, ctx: Context, d: Decision) -> None:
-    """Record a refusal: failing check, every dismissal, one updated comment. Raise on errors.
+    """Record a refusal: failing check first, then one updated comment. Raise on errors.
 
     A merged or closed pull request gets no writes at all.
     """
@@ -631,19 +641,22 @@ def refuse(client: Client, ctx: Context, d: Decision) -> None:
     text = (f"**autonomy-gate refused** this pull request.\n\n"
             f"- rule: `{d.rule}`\n- detail: {d.detail}\n- head SHA: `{d.head_sha}`\n"
             f"- mandate blob SHA: `{d.mandate_blob_sha}`\n- evaluated at: {ctx.now.isoformat()}")
-    # Order matters: the failing check first, so a failed dismissal cannot leave
-    # an approval next to a newest check of success.
-    errors = withdraw(client, ctx.repo, d.pr_number, d.head_sha, text, f"refused by rule {d.rule}")
+    errors: list[str] = []
+    if d.head_sha:
+        try:
+            set_check(client, ctx.repo, d.head_sha, False, text)
+        except Exception as exc:  # noqa: BLE001 - still comment
+            errors.append(f"failing check: {type(exc).__name__}: {exc}")
     if d.pr_number is not None:
         try:
-            upsert_comment(client, ctx.repo, d.pr_number, text)
+            upsert_comment(client, ctx, d.pr_number, text)
         except Exception as exc:  # noqa: BLE001 - collected
             errors.append(f"comment: {type(exc).__name__}: {exc}")
     if errors:
         raise RuntimeError("; ".join(errors))
 
 
-def recheck_before_approval(client: Client, ctx: Context, d: Decision) -> None:
+def recheck_before_success(client: Client, ctx: Context, d: Decision) -> None:
     """Re-read head, label, branch, main and the mandate. Any change is a refusal.
 
     Removing the label is a per-pull-request stop that needs no admin rights.
@@ -662,23 +675,18 @@ def recheck_before_approval(client: Client, ctx: Context, d: Decision) -> None:
     check_branch_and_label(pr, mandate)
 
 
-def approve_and_merge(client: Client, ctx: Context, d: Decision) -> Decision:
-    """Pending check, re-check, approve, success check, merge with sha = X. No retry."""
+def check_and_merge(client: Client, ctx: Context, d: Decision) -> Decision:
+    """Pending check, re-check, success check, merge with sha = X. No retry, no review."""
     assert d.approved and d.pr_number is not None and d.head_sha, "need an approved decision"
+    assert not ctx.dry_run, "a dry run never writes"
     fail = lambda rule, detail: Decision(False, rule, detail, d.pr_number, d.head_sha, d.mandate_blob_sha, d.main_sha)  # noqa: E731
     set_check(client, ctx.repo, d.head_sha, False, "merge in progress; not approved yet")
     try:
-        recheck_before_approval(client, ctx, d)
+        recheck_before_success(client, ctx, d)
     except Refusal as exc:
         return fail(exc.rule, exc.detail)
+    # From here a success check may exist. The cleanup step reads this journal.
     ctx.journal({"pr": d.pr_number, "head": d.head_sha, "merged": False})
-    review = client.request("POST", f"/repos/{ctx.repo}/pulls/{d.pr_number}/reviews", {
-        "commit_id": d.head_sha, "event": "APPROVE",
-        "body": f"{COMMENT_MARKER}\nautonomy-gate approves head `{d.head_sha}` "
-                f"under mandate blob `{d.mandate_blob_sha}`.",
-    })
-    if review.status != 200:
-        return fail("approve-failed", f"review returned HTTP {review.status}")
     set_check(client, ctx.repo, d.head_sha, True,
               f"All rules passed for head {d.head_sha} under mandate blob {d.mandate_blob_sha}.")
     merge = client.request("PUT", f"/repos/{ctx.repo}/pulls/{d.pr_number}/merge", {
@@ -693,7 +701,10 @@ def approve_and_merge(client: Client, ctx: Context, d: Decision) -> Decision:
 
 
 def run(client: Client, ctx: Context) -> Decision | None:
-    """Evaluate one pull request and act on the result. Return the final Decision."""
+    """Evaluate one pull request and act on the result. Return the final Decision.
+
+    In a dry run the gate evaluates and returns; it makes no write at all.
+    """
     try:
         pr_number = resolve_pr_number(ctx, client)
     except Refusal as exc:
@@ -701,10 +712,12 @@ def run(client: Client, ctx: Context) -> Decision | None:
     if pr_number is None:
         return None
     decision = evaluate(client, ctx, pr_number)  # never raises: errors become internal-error
+    if ctx.dry_run:
+        return decision
     if decision.approved:
         try:
-            decision = approve_and_merge(client, ctx, decision)
-        except Exception as exc:  # noqa: BLE001 - fail closed; undo any approval below
+            decision = check_and_merge(client, ctx, decision)
+        except Exception as exc:  # noqa: BLE001 - fail closed; post a failing check below
             decision.approved = False
             decision.rule, decision.detail = "internal-error", f"{type(exc).__name__}: {exc}"
     if not decision.approved:
@@ -712,15 +725,16 @@ def run(client: Client, ctx: Context) -> Decision | None:
     return decision
 
 
-CLEANUP_SUMMARY = "merge not confirmed; approval withdrawn by cleanup"
+CLEANUP_SUMMARY = "merge not confirmed; success withdrawn by cleanup"
 
 
 def cleanup(client: Client, repo: str, state: dict[str, Any] | None) -> bool:
-    """If an approval may exist and the merge is not confirmed, undo it. Return True if undone.
+    """If a success check may exist and the merge is not confirmed, post a failing check.
 
     `state` is {"pr": int, "head": SHA or None, "merged": bool}. The pull request
     is read first: merged or closed means no writes (this covers a merge that the
-    server completed after the client timed out). Errors are raised at the end.
+    server completed after the client timed out). The newest check run of the
+    gate app then is a failure, so the head cannot merge. Errors are raised.
     """
     if not state or state.get("merged") is True:
         return False
@@ -728,7 +742,7 @@ def cleanup(client: Client, repo: str, state: dict[str, Any] | None) -> bool:
     head = state.get("head")
     try:
         pr = api_get(client, f"/repos/{repo}/pulls/{pr_number}")
-    except Exception:  # noqa: BLE001 - unknown state: do the safe actions
+    except Exception:  # noqa: BLE001 - unknown state: do the safe action
         pr = None
     if isinstance(pr, dict):
         if pr.get("merged") is True or pr.get("state") != "open":
@@ -736,11 +750,9 @@ def cleanup(client: Client, repo: str, state: dict[str, Any] | None) -> bool:
         if head is None:
             head = str((pr.get("head") or {}).get("sha", ""))
     head = head if isinstance(head, str) and SHA.fullmatch(head) else None
-    errors = withdraw(client, repo, pr_number, head, CLEANUP_SUMMARY, "merge not confirmed; approval withdrawn")
     if head is None:
-        errors.append("no head SHA known; no failing check posted")
-    if errors:
-        raise RuntimeError("; ".join(errors))
+        raise RuntimeError("no head SHA known; no failing check posted")
+    set_check(client, repo, head, False, CLEANUP_SUMMARY)
     return True
 
 
@@ -812,12 +824,12 @@ def run_cleanup(client: Client, repo: str, text: str | None,
                 fallback_pr: Callable[[], int | None]) -> int:
     """Cleanup step logic. Return the exit code. A defect or a failed undo exits 1.
 
-    A corrupt state file means an approval MAY exist. The pull request number
+    A corrupt state file means a success check MAY exist. The pull request number
     then comes from the event, the head SHA from the pull request, and the safe
     actions still run. The step still fails, so the defect is visible.
     """
     if text is None:
-        print("autonomy-gate cleanup: no approval was given")
+        print("autonomy-gate cleanup: no success check was posted")
         return 0
     corrupt = False
     try:
@@ -835,7 +847,7 @@ def run_cleanup(client: Client, repo: str, text: str | None,
     except Exception as exc:  # noqa: BLE001 - report loudly
         print(safe_log(f"autonomy-gate cleanup FAILED: {type(exc).__name__}: {exc}"), file=sys.stderr)
         return 1
-    print(f"autonomy-gate cleanup: approval withdrawn={undone}")
+    print(f"autonomy-gate cleanup: success withdrawn={undone}")
     return 1 if corrupt else 0
 
 
@@ -848,13 +860,31 @@ def read_text(path: str) -> str | None:
         return None
 
 
-def event_context(repo: str, journal: Callable[[dict[str, Any]], None]) -> Context:
+def event_context(repo: str, journal: Callable[[dict[str, Any]], None],
+                  bot_login: str = "", dry_run: bool = False) -> Context:
     """Build the Context from the runner environment."""
     with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as handle:
         event = json.load(handle)
     return Context(repo=repo, event_name=os.environ["GITHUB_EVENT_NAME"], event=event,
                    stop_value=os.environ.get("AUTONOMY_ENABLED", ""), now=utc_now(),
-                   ref=os.environ.get("GITHUB_REF", ""), journal=journal)
+                   ref=os.environ.get("GITHUB_REF", ""), journal=journal,
+                   bot_login=bot_login, dry_run=dry_run)
+
+
+def build_client() -> tuple[Client, str, bool]:
+    """Return (client, gate bot login, dry_run) from the runner environment.
+
+    GETs use GITHUB_TOKEN (read-only). Writes use GATE_TOKEN (the gate app).
+    No GATE_TOKEN means a dry run: the writer refuses every write.
+    """
+    reader = RestClient(os.environ["GITHUB_TOKEN"])
+    gate_token = os.environ.get("GATE_TOKEN", "")
+    if not gate_token:
+        return SplitClient(reader, NoWriteClient()), "", True
+    slug = os.environ.get("GATE_APP_SLUG", "")
+    if not APP_SLUG.fullmatch(slug):
+        raise RuntimeError("GATE_APP_SLUG is missing or malformed")
+    return SplitClient(reader, RestClient(gate_token)), f"{slug}[bot]", False
 
 
 def exit_code(decision: Decision | None) -> int:
@@ -868,7 +898,7 @@ def main(argv: list[str]) -> int:
     """Entry point for the workflow. Any unexpected exception exits 1."""
     try:
         repo = os.environ["GITHUB_REPOSITORY"]
-        client = RestClient(os.environ["GITHUB_TOKEN"])
+        client, bot_login, dry_run = build_client()
         if argv[1:] == ["--cleanup"]:
             def fallback() -> int | None:
                 try:
@@ -876,15 +906,20 @@ def main(argv: list[str]) -> int:
                 except Exception:  # noqa: BLE001 - no fallback number
                     return None
             return run_cleanup(client, repo, read_text(state_path()), fallback)
-        decision = run(client, event_context(repo, write_state))
+        decision = run(client, event_context(repo, write_state, bot_login, dry_run))
     except Exception as exc:  # noqa: BLE001 - fail closed on any error
         print(safe_log(f"autonomy-gate internal error: {type(exc).__name__}: {exc}"), file=sys.stderr)
         return 1
     if decision is None:
         print("autonomy-gate: no pull request to evaluate for this event")
         return 0
+    if dry_run:
+        print(safe_log(f"autonomy-gate DRY RUN (no gate app token; no writes): pr={decision.pr_number} "
+                       f"head={decision.head_sha} would_merge={decision.approved} rule={decision.rule} "
+                       f"detail={decision.detail}"))
+        return 1
     print(safe_log(f"autonomy-gate: pr={decision.pr_number} head={decision.head_sha} "
-                   f"approved_and_merged={decision.approved} rule={decision.rule} detail={decision.detail}"))
+                   f"merged={decision.approved} rule={decision.rule} detail={decision.detail}"))
     return exit_code(decision)
 
 

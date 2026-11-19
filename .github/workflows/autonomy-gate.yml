@@ -13,6 +13,17 @@
 #
 # Shell safety: no `${{ }}` expression in any `run:` script. The script reads
 # the event from GITHUB_EVENT_PATH and all other data from the REST API.
+#
+# Credentials (see docs/GATE-APP-SETUP.md):
+# - The workflow GITHUB_TOKEN is READ-ONLY. gate.py uses it for every GET.
+# - Every write (check run, comment, merge) uses an installation token of the
+#   dedicated gate GitHub App. Its client ID and private key are secrets of the
+#   environment `autonomy-gate`, whose deployment-branch policy allows `main`
+#   only. A workflow that runs on any other ref (a pull request merge ref, an
+#   agent's branch, a tag, a dispatch from a branch) cannot read them.
+# - Branch protection requires the `autonomy-gate` check from the gate app's id.
+#   A check that any other workflow creates (as GitHub Actions, app 15368) does
+#   not count. The gate submits NO review; the check run is the approval.
 name: autonomy-gate
 
 on:
@@ -46,42 +57,68 @@ jobs:
     # workflow_dispatch runs the workflow file from the ref the caller picks.
     # Allow a dispatch only from main. gate.py checks GITHUB_REF again.
     # LIMIT: a copy of this file on another ref that an attacker has EDITED
-    # can drop this line; only the token's lack of Workflows permission stops that.
+    # can drop this line. That copy runs with that ref, so the environment's
+    # main-only branch policy refuses it the gate app secrets.
     if: github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # The merge lane: only one gate run in the repository evaluates, approves
-    # or merges at a time. The running job is never cancelled by a newer one.
+    # The gate app secrets live here. Branch policy: main only.
+    environment: autonomy-gate
+    # The merge lane: only one gate run in the repository evaluates or merges
+    # at a time. The running job is never cancelled by a newer one.
     concurrency:
       group: autonomy-gate-merge-lane
       cancel-in-progress: false
+    # The workflow token reads only. Writes use the gate app token.
     permissions:
-      contents: write        # merge endpoint
-      pull-requests: write   # approve, dismiss approvals, comment
-      checks: write          # create the autonomy-gate check run (see SETUP.md)
-      actions: read          # read the ci.yml run and its jobs
+      contents: read
+      pull-requests: read
+      issues: read
+      actions: read
+    env:
+      # "true" or "false" only; never the secret value. No secret means dry run.
+      GATE_APP_CONFIGURED: ${{ secrets.GATE_APP_CLIENT_ID != '' && secrets.GATE_APP_PRIVATE_KEY != '' }}
     steps:
       - name: Check out gate code from main only
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          ref: main
+          # Full ref name: a tag named `main` cannot shadow the branch.
+          ref: refs/heads/main
           persist-credentials: false
           sparse-checkout: .github/autonomy
           sparse-checkout-cone-mode: false
+      # Mint a short-lived installation token for the gate app. The token is
+      # narrowed to this repository and to the three write permissions the gate
+      # needs. The action revokes it in its post step, after the cleanup step.
+      - name: Mint gate app token
+        id: gate-app
+        if: env.GATE_APP_CONFIGURED == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.GATE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.GATE_APP_PRIVATE_KEY }}
+          permission-checks: write
+          permission-contents: write
+          permission-pull-requests: write
       - name: Evaluate one pull request
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # Empty when the gate app is not configured: gate.py then runs a dry run.
+          GATE_TOKEN: ${{ steps.gate-app.outputs.token }}
+          GATE_APP_SLUG: ${{ steps.gate-app.outputs.app-slug }}
           # Read at run time from repository settings, not from the pull request.
           AUTONOMY_ENABLED: ${{ vars.AUTONOMY_ENABLED }}
         # -I: isolated mode. Ignore PYTHON* variables and the current directory.
-        # Order inside gate.py: pending check, re-check, approve, success check, merge.
+        # Order inside gate.py: pending check, re-check, success check, merge.
         run: python3 -I .github/autonomy/gate.py
       # Runs even if the job is cancelled or the step above fails. If gate.py
-      # approved but did not confirm the merge, post a failing check, then
-      # dismiss the gate's approvals. A merged or closed pull request gets no
-      # writes. Best effort: if the runner itself dies, this does not run.
-      - name: Withdraw approval unless the merge is confirmed
+      # posted a success check but did not confirm the merge, post a failing
+      # gate app check on the same head. A merged or closed pull request gets
+      # no writes. Best effort: if the runner itself dies, this does not run.
+      - name: Withdraw success unless the merge is confirmed
         if: always()
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GATE_TOKEN: ${{ steps.gate-app.outputs.token }}
+          GATE_APP_SLUG: ${{ steps.gate-app.outputs.app-slug }}
         run: python3 -I .github/autonomy/gate.py --cleanup
