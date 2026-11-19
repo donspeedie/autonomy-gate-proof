@@ -11,7 +11,7 @@
   "branch_prefix": "autonomy/tests-",
   "label": "autonomy",
   "max_open_prs": 1,
-  "max_merges_per_utc_day": 2,
+  "max_merges_per_utc_day": 5,
   "max_total_merges": 5,
   "required_ci_workflow": "ci.yml",
   "required_ci_jobs": ["tests", "gate-tests"]
