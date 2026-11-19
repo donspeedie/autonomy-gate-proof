@@ -27,6 +27,7 @@ MAIN = "d" * 40
 HEAD = "a" * 40
 OTHER = "b" * 40
 BLOB = "c" * 40
+GATE_BOT = "example-gate-app[bot]"
 NOW = dt.datetime(2026, 11, 20, 12, 0, tzinfo=dt.timezone.utc)
 MANDATE = json.loads(
     (pathlib.Path(__file__).resolve().parent.parent / ".github" / "autonomy" / "mandate.json").read_text()
@@ -78,11 +79,10 @@ class World:
     pr_labels: list[list[str]] | None = None  # successive label sets of the pull request
     merged: bool = False  # the server state of the pull request
     merged_on_merge_call: bool = False  # the merge call merges, then raises (client timeout)
+    closed_on_merge_call: bool = False  # the agent closes the pull request just before the merge call
     raise_on: str = ""  # a write path suffix that raises TimeoutError
     comments: list[dict[str, Any]] = field(default_factory=list)
-    reviews: list[dict[str, Any]] = field(default_factory=list)
-    review_status: int = 200
-    dismiss_status: int = 200
+    check_statuses: list[int] = field(default_factory=list)  # successive check-run statuses; then 201
     merge_status: int = 200
     sha_pulls: list[dict[str, Any]] = field(default_factory=lambda: [make_pr()])
     list_pages: int = 1
@@ -126,6 +126,9 @@ class FakeClient:
         base = path.split("?", 1)[0]
         if method == "GET":
             return self._get(base, path)
+        if base.endswith("/merge") and self.w.closed_on_merge_call:
+            self.w.pr["state"] = "closed"
+            return gate.Response(405, {"message": "Pull Request is not mergeable"})
         if base.endswith("/merge") and self.w.merged_on_merge_call:
             self.w.merged = True
             raise TimeoutError("The read operation timed out")
@@ -133,10 +136,8 @@ class FakeClient:
             raise TimeoutError("The read operation timed out")
         if base.endswith("/merge"):
             return gate.Response(self.w.merge_status, {"merged": self.w.merge_status == 200})
-        if base.endswith("/dismissals"):
-            return gate.Response(self.w.dismiss_status, {})
-        if base.endswith("/reviews"):
-            return gate.Response(self.w.review_status, {})
+        if base.endswith("/check-runs") and self.w.check_statuses:
+            return gate.Response(self.w.check_statuses.pop(0), {})
         return gate.Response({"POST": 201, "PATCH": 200, "PUT": 200}[method], {})
 
     def _get(self, base: str, path: str) -> gate.Response:
@@ -178,7 +179,6 @@ class FakeClient:
             f"{r}/actions/workflows/ci.yml/runs": {"workflow_runs": w.runs},
             f"{r}/actions/runs/900/jobs": {"jobs": w.jobs},
             f"{r}/issues/{PR}/comments": w.comments,
-            f"{r}/pulls/{PR}/reviews": w.reviews,
             f"{r}/commits/{HEAD}/pulls": w.sha_pulls,
             # Present only to prove the gate never uses the unpinned file list.
             f"{r}/pulls/{PR}/files": [{"filename": "tests/test_units.py", "status": "added", "additions": 1}],
@@ -192,11 +192,12 @@ class FakeClient:
 
 
 def ctx(stop: str = "true", event_name: str = "workflow_dispatch", event: dict[str, Any] | None = None,
-        ref: str = "refs/heads/main", clock: Any = None, journal: Any = None) -> gate.Context:
+        ref: str = "refs/heads/main", clock: Any = None, journal: Any = None,
+        dry_run: bool = False) -> gate.Context:
     return gate.Context(repo=REPO, event_name=event_name,
                         event=event if event is not None else {"inputs": {"pr_number": str(PR)}},
                         stop_value=stop, now=NOW, ref=ref, clock=clock or (lambda: NOW),
-                        journal=journal or gate.no_journal)
+                        journal=journal or gate.no_journal, bot_login=GATE_BOT, dry_run=dry_run)
 
 
 def run(world: World, **kwargs: Any) -> tuple[gate.Decision | None, FakeClient]:
@@ -208,7 +209,7 @@ def assert_refused(world: World, rule: str, **kwargs: Any) -> FakeClient:
     decision, client = run(world, **kwargs)
     assert decision is not None and not decision.approved
     assert decision.rule == rule, decision.detail
-    assert not client.wrote("POST", "/reviews"), "must never approve"
+    assert not client.wrote("POST", "/reviews"), "must never review"
     assert not client.wrote("PUT", "/merge"), "must never merge"
     checks = client.wrote("POST", "/check-runs")
     assert checks and checks[-1]["conclusion"] == "failure"
@@ -223,15 +224,16 @@ def test_happy_path_order_and_exact_sha() -> None:
     journal: list[dict[str, Any]] = []
     decision, client = run(World(), journal=journal.append)
     assert decision is not None and decision.approved
-    review = client.wrote("POST", "/reviews")[0]
-    assert review["event"] == "APPROVE" and review["commit_id"] == HEAD
-    assert HEAD in review["body"] and BLOB in review["body"]
+    assert not client.wrote("POST", "/reviews"), "the gate submits no review"
+    success = client.wrote("POST", "/check-runs")[-1]
+    assert success["conclusion"] == "success" and success["head_sha"] == HEAD
+    assert HEAD in success["output"]["summary"] and BLOB in success["output"]["summary"]
     merge = client.wrote("PUT", "/merge")[0]
     assert merge["sha"] == HEAD and merge["merge_method"] == "squash"
     writes = [(m, p.split("?")[0].rsplit("/", 1)[-1], (b or {}).get("conclusion"))
               for m, p, b in client.calls if m != "GET"]
-    assert writes == [("POST", "check-runs", "failure"), ("POST", "reviews", None),
-                      ("POST", "check-runs", "success"), ("PUT", "merge", None)]
+    assert writes == [("POST", "check-runs", "failure"), ("POST", "check-runs", "success"),
+                      ("PUT", "merge", None)]
     assert journal == [{"pr": PR, "head": HEAD, "merged": False}, {"pr": PR, "head": HEAD, "merged": True}]
     assert not [p for _, p, _ in client.calls if p.split("?")[0].endswith("/files")], "unpinned list used"
 
@@ -436,18 +438,49 @@ def writes(client: FakeClient) -> list[tuple[str, str]]:
     return [(m, p) for m, p, _ in client.calls if m != "GET"]
 
 
-def test_not_open_makes_no_writes() -> None:
+def test_closed_unmerged_pr_gets_failing_check_and_no_comment() -> None:
+    """A closed pull request can be reopened. It is not finished: post a failing check."""
     w = World()
     w.pr["state"] = "closed"
     decision, client = run(w)
     assert decision is not None and decision.rule == "not-open"
-    assert writes(client) == []
+    assert [p.rsplit("/", 1)[-1] for _, p in writes(client)] == ["check-runs"]
+    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
+
+
+def test_close_before_merge_leaves_failing_check() -> None:
+    """Attack: the agent closes the PR after the success check and before the merge call."""
+    w = World(closed_on_merge_call=True)
+    decision, client = run(w)
+    assert decision is not None and not decision.approved and decision.rule == "merge-refused"
+    checks = client.wrote("POST", "/check-runs")
+    assert [c["conclusion"] for c in checks] == ["failure", "success", "failure"]
+    assert checks[-1]["head_sha"] == HEAD
+
+
+def test_reopen_after_close_before_merge_has_no_success_check() -> None:
+    """After the attack, the agent reopens. The newest gate check on X stays a failure."""
+    w = World(closed_on_merge_call=True)
+    _, first = run(w)
+    w.pr["state"] = "open"
+    w.closed_on_merge_call = False
+    _, second = run(w, stop="false")  # the stop switch is off after the incident
+    checks = first.wrote("POST", "/check-runs") + second.wrote("POST", "/check-runs")
+    assert checks[-1]["conclusion"] == "failure" and checks[-1]["head_sha"] == HEAD
+    assert not second.wrote("PUT", "/merge")
+
+
+def test_cleanup_posts_failing_check_on_closed_unmerged_pr() -> None:
+    w = World()
+    w.pr["state"] = "closed"
+    client = FakeClient(w)
+    assert gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False}) is True
+    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
 
 
 def test_merged_pr_makes_no_writes() -> None:
-    """Re-running the gate after a merge: no comment, no check, no dismissal."""
+    """Re-running the gate after a merge: no comment, no check."""
     w = World(merged=True)
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
     decision, client = run(w)
     assert decision is not None and decision.rule == "not-open"
     assert writes(client) == []
@@ -526,8 +559,8 @@ def test_mandate_changed_before_approval() -> None:
     assert not client.wrote("POST", "/reviews")
 
 
-def test_label_removed_before_approval_stops_this_pr() -> None:
-    """NOTE 7: removing the label between evaluation and approval is a per-PR stop."""
+def test_label_removed_before_success_stops_this_pr() -> None:
+    """NOTE 7: removing the label between evaluation and the success check is a per-PR stop."""
     w = World(pr_labels=[["autonomy"], []])
     decision, client = run(w)
     assert decision is not None and decision.rule == "label"
@@ -743,72 +776,63 @@ def test_head_changed_at_merge_returns_409() -> None:
     assert journal == [{"pr": PR, "head": HEAD, "merged": False}]
 
 
-def test_approve_failed() -> None:
-    decision, client = run(World(review_status=422))
-    assert decision is not None and decision.rule == "approve-failed"
-    assert not client.wrote("PUT", "/merge")
-    assert not any(c["conclusion"] == "success" for c in client.wrote("POST", "/check-runs"))
+def test_gate_never_reviews_or_dismisses() -> None:
+    """With no required review, the gate writes only check runs, comments and the merge."""
+    for world in (World(), World(merge_status=405), World(pr_labels=[["autonomy"], []])):
+        _, client = run(world)
+        assert not [p for m, p, _ in client.calls if m != "GET" and ("/reviews" in p or "/dismissals" in p)]
 
 
-def test_failed_merge_dismisses_gate_approval_only() -> None:
-    w = World(merge_status=405)
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}},
-                 {"id": 56, "state": "APPROVED", "user": {"login": "someone"}}]
-    decision, client = run(w)
+def test_failed_merge_posts_failing_check_after_success() -> None:
+    decision, client = run(World(merge_status=405))
     assert decision is not None and decision.rule == "merge-refused"
-    dismissed = [p for m, p, _ in client.calls if m == "PUT" and p.endswith("/dismissals")]
-    assert dismissed == [f"/repos/{REPO}/pulls/{PR}/reviews/55/dismissals"]
+    checks = [c["conclusion"] for c in client.wrote("POST", "/check-runs")]
+    assert checks == ["failure", "success", "failure"], "the newest gate check is a failure"
+    assert client.wrote("POST", "/comments")
 
 
-def test_dismissal_failure_is_loud_and_failing_check_is_posted_first() -> None:
-    w = World(merge_status=405, dismiss_status=403)
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}},
-                 {"id": 57, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
-    client = FakeClient(w)
-    with pytest.raises(RuntimeError, match="dismissal"):
+def test_failing_check_write_failure_is_loud_and_comment_still_written() -> None:
+    client = FakeClient(World(merge_status=405, check_statuses=[201, 201, 500]))
+    with pytest.raises(RuntimeError, match="failing check"):
         gate.run(client, ctx())
-    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
-    after_merge = writes(client)[[m for m, _ in writes(client)].index("PUT"):]
-    kinds = [p.rsplit("/", 1)[-1] for _, p in after_merge]
-    assert kinds[:4] == ["merge", "check-runs", "dismissals", "dismissals"], "check first, every dismissal tried"
     assert client.wrote("POST", "/comments"), "the comment is still written"
 
 
-def test_cleanup_withdraws_when_merge_not_confirmed() -> None:
+def test_pending_check_failure_stops_before_success() -> None:
+    """If the first (pending) check cannot be written, no success check and no merge follow."""
+    client = FakeClient(World(check_statuses=[500]))
+    decision = gate.run(client, ctx())
+    assert decision is not None and decision.rule == "internal-error"
+    assert not any(c["conclusion"] == "success" for c in client.wrote("POST", "/check-runs"))
+    assert not client.wrote("PUT", "/merge")
+
+
+def test_cleanup_posts_failing_check_when_merge_not_confirmed() -> None:
     """Simulates the `if: always()` step after a cancelled run (fake only)."""
-    w = World()
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
-    client = FakeClient(w)
+    client = FakeClient(World())
     assert gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False}) is True
-    assert client.wrote("PUT", "/dismissals")
+    assert [p.rsplit("/", 1)[-1] for _, p in writes(client)] == ["check-runs"]
     assert client.wrote("POST", "/check-runs")[-1] == {
         "name": "autonomy-gate", "head_sha": HEAD, "status": "completed", "conclusion": "failure",
-        "output": {"title": "not approved", "summary": "merge not confirmed; approval withdrawn by cleanup"}}
+        "output": {"title": "not approved", "summary": "merge not confirmed; success withdrawn by cleanup"}}
 
 
 @pytest.mark.parametrize("state", [None, {"pr": PR, "head": HEAD, "merged": True}])
-def test_cleanup_does_nothing_when_merged_or_not_approved(state: Any) -> None:
+def test_cleanup_does_nothing_when_merged_or_no_success(state: Any) -> None:
     client = FakeClient(World())
     assert gate.cleanup(client, REPO, state) is False
     assert not client.calls
 
 
-def test_cleanup_dismissal_failure_raises_after_failing_check() -> None:
-    w = World(dismiss_status=500)
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
-    client = FakeClient(w)
-    with pytest.raises(RuntimeError, match="dismissal"):
+def test_cleanup_check_failure_raises() -> None:
+    client = FakeClient(World(check_statuses=[500]))
+    with pytest.raises(RuntimeError, match="check run"):
         gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False})
-    assert [p.rsplit("/", 1)[-1] for _, p in writes(client)] == ["check-runs", "dismissals"]
-    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
 
 
-@pytest.mark.parametrize(("merged", "state"), [(True, "closed"), (False, "closed")])
-def test_cleanup_does_nothing_when_server_says_merged_or_closed(merged: bool, state: str) -> None:
-    """The journal says not merged, but the server merged after a client timeout (or closed)."""
-    w = World(merged=merged)
-    w.pr["state"] = state
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
+def test_cleanup_does_nothing_when_server_says_merged() -> None:
+    """The journal says not merged, but the server merged after a client timeout."""
+    w = World(merged=True)
     client = FakeClient(w)
     assert gate.cleanup(client, REPO, {"pr": PR, "head": HEAD, "merged": False}) is False
     assert writes(client) == []
@@ -817,21 +841,12 @@ def test_cleanup_does_nothing_when_server_says_merged_or_closed(merged: bool, st
 # ------------------------------------------------------------- internal errors (NOTE 9)
 
 
-def test_exception_at_review_call_posts_failing_check() -> None:
-    decision, client = run(World(raise_on="/reviews"))
+def test_timeout_at_merge_call_that_did_not_merge() -> None:
+    w = World(raise_on="/merge")
+    decision, client = run(w)
     assert decision is not None and decision.rule == "internal-error" and "TimeoutError" in decision.detail
     assert gate.exit_code(decision) == 1
     assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
-    assert not client.wrote("PUT", "/merge")
-
-
-def test_timeout_at_merge_call_that_did_not_merge() -> None:
-    w = World(raise_on="/merge")
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
-    decision, client = run(w)
-    assert decision is not None and decision.rule == "internal-error" and gate.exit_code(decision) == 1
-    assert client.wrote("POST", "/check-runs")[-1]["conclusion"] == "failure"
-    assert client.wrote("PUT", "/dismissals")
 
 
 def test_timeout_at_merge_call_that_merged_makes_no_more_writes() -> None:
@@ -856,13 +871,10 @@ def test_non_refusal_exception_inside_evaluation_posts_failing_check() -> None:
 
 @pytest.mark.parametrize("text", ['{"pr": 7, "head": "aaa', "[]", '{"pr": "7", "head": null}', ""])
 def test_cleanup_with_corrupt_state_still_withdraws_and_fails(text: str) -> None:
-    w = World()
-    w.reviews = [{"id": 55, "state": "APPROVED", "user": {"login": "github-actions[bot]"}}]
-    client = FakeClient(w)
+    client = FakeClient(World())
     assert gate.run_cleanup(client, REPO, text, lambda: PR) == 1
     check = client.wrote("POST", "/check-runs")[-1]
     assert check["conclusion"] == "failure" and check["head_sha"] == HEAD, "head taken from the pull request"
-    assert client.wrote("PUT", "/dismissals")
 
 
 def test_cleanup_with_corrupt_state_and_no_event_pr_fails() -> None:
@@ -884,7 +896,8 @@ def test_main_exits_1_on_internal_error_and_journal_is_atomic(tmp_path: pathlib.
     event.write_text(json.dumps({"inputs": {"pr_number": str(PR)}}))
     for key, value in {"GITHUB_REPOSITORY": REPO, "GITHUB_TOKEN": "x", "GITHUB_EVENT_PATH": str(event),
                        "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
-                       "AUTONOMY_ENABLED": "true", "RUNNER_TEMP": str(tmp_path)}.items():
+                       "AUTONOMY_ENABLED": "true", "RUNNER_TEMP": str(tmp_path),
+                       "GATE_TOKEN": "y", "GATE_APP_SLUG": "example-gate-app"}.items():
         monkeypatch.setenv(key, value)
     monkeypatch.setattr(gate, "RestClient", lambda _token: FakeClient(w))
     monkeypatch.setattr(gate, "utc_now", lambda: NOW)
@@ -917,7 +930,8 @@ def test_existing_gate_comment_is_updated_not_duplicated() -> None:
     w = World()
     w.pr["labels"] = []
     w.comments = [{"id": 11, "user": {"login": "someone"}, "body": gate.COMMENT_MARKER},
-                  {"id": 12, "user": {"login": "github-actions[bot]"}, "body": gate.COMMENT_MARKER + "\nold"}]
+                  {"id": 10, "user": {"login": "github-actions[bot]"}, "body": gate.COMMENT_MARKER},
+                  {"id": 12, "user": {"login": GATE_BOT}, "body": gate.COMMENT_MARKER + "\nold"}]
     client = assert_refused(w, "label")
     assert [p for m, p, _ in client.calls if m == "PATCH"] == [f"/repos/{REPO}/issues/comments/12"]
     assert not client.wrote("POST", "/comments")
@@ -983,3 +997,106 @@ def test_workflow_run_with_multiple_linked_prs_does_nothing() -> None:
 ])
 def test_path_matches_does_not_cross_slash(path: str, ok: bool) -> None:
     assert gate.path_matches(path, "tests/test_*.py") is ok
+
+
+# ------------------------------------------------------------- gate app token and dry run
+
+
+class Recorder:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> gate.Response:
+        self.calls.append(method)
+        return gate.Response(200, {})
+
+
+def test_split_client_reads_with_workflow_token_and_writes_with_gate_token() -> None:
+    reader, writer = Recorder(), Recorder()
+    split = gate.SplitClient(reader, writer)
+    for method in ("GET", "POST", "PATCH", "PUT", "GET"):
+        split.request(method, "/x")
+    assert reader.calls == ["GET", "GET"] and writer.calls == ["POST", "PATCH", "PUT"]
+
+
+def test_no_write_client_refuses_every_write() -> None:
+    with pytest.raises(RuntimeError, match="dry run"):
+        gate.NoWriteClient().request("POST", "/repos/x/check-runs", {})
+
+
+@pytest.mark.parametrize("world", [World(), World(pr_labels=[[]]), World(merge_status=405)],
+                         ids=["valid", "refused", "merge-would-fail"])
+def test_dry_run_evaluates_and_writes_nothing(world: World) -> None:
+    client = FakeClient(world)
+    decision = gate.run(client, ctx(dry_run=True))
+    assert decision is not None
+    assert writes(client) == []
+
+
+def test_dry_run_reports_the_rule() -> None:
+    w = World()
+    w.pr["labels"] = []
+    decision = gate.run(FakeClient(w), ctx(dry_run=True))
+    assert decision is not None and decision.rule == "label" and not decision.approved
+
+
+def set_env(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path, **extra: str) -> None:
+    event = tmp_path / "event.json"
+    event.write_text(json.dumps({"inputs": {"pr_number": str(PR)}}))
+    env = {"GITHUB_REPOSITORY": REPO, "GITHUB_TOKEN": "x", "GITHUB_EVENT_PATH": str(event),
+           "GITHUB_EVENT_NAME": "workflow_dispatch", "GITHUB_REF": "refs/heads/main",
+           "AUTONOMY_ENABLED": "true", "RUNNER_TEMP": str(tmp_path)}
+    env.update(extra)
+    for key in ("GATE_TOKEN", "GATE_APP_SLUG"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+
+
+def test_main_without_gate_token_is_a_dry_run(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+                                              capsys: pytest.CaptureFixture[str]) -> None:
+    set_env(monkeypatch, tmp_path)
+    clients: list[FakeClient] = []
+
+    def make(_token: str) -> FakeClient:
+        clients.append(FakeClient(World()))
+        return clients[-1]
+
+    monkeypatch.setattr(gate, "RestClient", make)
+    monkeypatch.setattr(gate, "utc_now", lambda: NOW)
+    assert gate.main(["gate.py"]) == 1
+    assert "DRY RUN" in capsys.readouterr().out
+    assert len(clients) == 1, "only the read-only client is built"
+    assert writes(clients[0]) == []
+    assert not (tmp_path / gate.STATE_FILE).exists()
+    assert gate.main(["gate.py", "--cleanup"]) == 0, "no state file: nothing to withdraw"
+
+
+@pytest.mark.parametrize("slug", ["", "Bad_Slug", "x" * 70, "a[bot]"])
+def test_main_with_gate_token_needs_a_valid_slug(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path,
+                                                 slug: str) -> None:
+    set_env(monkeypatch, tmp_path, GATE_TOKEN="y", GATE_APP_SLUG=slug)
+    monkeypatch.setattr(gate, "RestClient", lambda _token: FakeClient(World()))
+    assert gate.main(["gate.py"]) == 1
+
+
+def test_main_with_gate_token_uses_it_for_writes(monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path) -> None:
+    set_env(monkeypatch, tmp_path, GATE_TOKEN="gate-token", GATE_APP_SLUG="example-gate-app")
+    w = World()
+    by_token: dict[str, FakeClient] = {}
+
+    def make(token: str) -> FakeClient:
+        by_token[token] = FakeClient(w)
+        return by_token[token]
+
+    monkeypatch.setattr(gate, "RestClient", make)
+    monkeypatch.setattr(gate, "utc_now", lambda: NOW)
+    assert gate.main(["gate.py"]) == 0
+    assert all(m == "GET" for m, _, _ in by_token["x"].calls), "the workflow token never writes"
+    kinds = [p.rsplit("/", 1)[-1] for _, p in writes(by_token["gate-token"])]
+    assert kinds == ["check-runs", "check-runs", "merge"]
+
+
+def test_check_run_needs_full_sha() -> None:
+    with pytest.raises(AssertionError):
+        gate.set_check(FakeClient(World()), REPO, "abc", False, "x")
